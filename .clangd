@@ -1,0 +1,37 @@
+---
+# 1. 扩大匹配范围，确保头文件也能享受 BPF 配置
+If:
+  PathMatch: [.*\.bpf\.c, .*/bpf/.*\.c, .*\.h] # 增加对 .h 的支持
+
+CompileFlags:
+  Add:
+    - "-target"
+    - "bpf"
+    - "-x"
+    - "c"
+    - "-std=gnu11"
+    - "-D__BPF_TRACING__"
+    - "-D__TARGET_ARCH_x86"      # 必须指定架构，否则 vmlinux.h 内部的部分条件编译会失效
+    - "-I."                      # 确保当前目录的头文件优先级最高
+    - "-I/usr/include/bpf"       # 指向 libbpf 头文件路径
+    - "-Wno-unknown-attributes"  # 忽略不认识的属性
+    - "-ferror-limit=0"          # 即使错误再多也不要停止解析，这对补全很重要
+
+  Remove:
+    - "-std=c++*"
+    - "-fexceptions"
+
+Diagnostics:
+  # 2. 针对 vmlinux.h 的重定义问题进行精准打击
+  Suppress:
+    - "redefinition"              # 抑制所有的符号重定义
+    - "typedef_redefinition"      # 特别针对 typedef 的冲突
+    - "too_many_errors"           # 彻底关掉那个烦人的警告
+    - "err_expected_identifer"    # 针对 vmlinux 内部属性解析失败的补救
+
+---
+# 3. 针对特定的 vmlinux.h 文件彻底关闭检查
+If:
+  PathMatch: .*vmlinux\.h
+Diagnostics:
+  Suppress: ["*"]
