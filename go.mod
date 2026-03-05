@@ -7,8 +7,8 @@ require (
 	github.com/cilium/ebpf v0.20.1-0.20260108141042-f7e80f49188b
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/common v0.67.5
-	k8s.io/api v0.35.0
-	k8s.io/apimachinery v0.35.0
+	k8s.io/api v0.35.1
+	k8s.io/apimachinery v0.35.1
 	k8s.io/client-go v0.35.0
 )
 
