@@ -3,7 +3,8 @@ package controller
 import (
 	"errors"
 	"log/slog"
-	"net"
+	"math"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -22,7 +23,6 @@ import (
 
 // Controller 负责监听 Kubernetes Service 和 Endpoints 资源的变化，并将服务和后端信息写入 eBPF Maps 中以实现透明化负载均衡。
 type Controller struct {
-	// TODO: client, bpf, informer/lister/synced, queue, metrics, activeServices, mu
 	bpfProg *bpf.Program
 
 	clients *k8s.Clientset
@@ -111,7 +111,11 @@ func (c *Controller) Run(stopCh <-chan struct{}) error {
 	cache.WaitForCacheSync(stopCh, c.svcSynced, c.epSynced)
 
 	// 启动多个 worker 来处理队列中的事件，确保能够及时响应 Kubernetes 中的资源变化并更新 eBPF 中的状态
-	for range 3 {
+	workerCount := runtime.NumCPU()
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	for range workerCount {
 		go c.runWorker()
 	}
 
@@ -196,12 +200,29 @@ func (c *Controller) refreshState(key string) error {
 	// 提交服务状态到 eBPF，并更新 svcStates
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+
+	if oldState, exist := c.svcStates[key]; exist {
+		newState := &serviceState{
+			IP:   svc.Spec.ClusterIP,
+			Port: strconv.Itoa(int(svc.Spec.Ports[0].Port)),
+			Pods: podStates,
+		}
+		if serviceStateEqual(oldState, newState) {
+			return nil
+		}
+	}
+
 	c.commitServiceState(key, svc.Spec.ClusterIP, strconv.Itoa(int(svc.Spec.Ports[0].Port)), podStates)
 
 	return nil
 }
 
 func (c *Controller) syncLoop(stopCh <-chan struct{}) {
+	if c.metrics == nil {
+		<-stopCh
+		return
+	}
+
 	// 每 10 秒执行一次全量同步，确保 eBPF 中的状态与 Kubernetes 中的实际状态保持一致。这对于处理漏掉的事件或修复不一致状态非常重要。
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -321,11 +342,11 @@ func (c *Controller) buildPodStates(endpointSlices []*discovery1.EndpointSlice, 
 		}
 
 		for _, endpoint := range endpointSlice.Endpoints {
-			for _, addr := range endpoint.Addresses {
-				if !checkHealth(addr, portStr) {
-					continue
-				}
+			if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
+				continue
+			}
 
+			for _, addr := range endpoint.Addresses {
 				weight := 1.0
 				if c.metrics != nil && endpoint.NodeName != nil {
 					// 如果启用了 metrics，并且 Endpoint 关联了 Node，则根据 Node 的指标计算权重
@@ -365,27 +386,35 @@ func (c *Controller) buildPodStates(endpointSlices []*discovery1.EndpointSlice, 
 
 func (c *Controller) commitServiceState(key, svcIP, svcPort string, pods []podState) {
 	// 首先清理旧的 eBPF 状态（如果存在），以避免残留的服务或后端信息导致不一致
+	hadState := false
 	if svcState, exist := c.svcStates[key]; exist {
+		hadState = true
 		c.bpfProg.AutoDeleteService(bpf.Service{
 			IP:   svcState.IP,
 			Port: svcState.Port,
 		}, nil)
 	}
 
+	if len(pods) == 0 {
+		delete(c.svcStates, key)
+		if hadState {
+			slog.Info("Service removed from eBPF due to empty backends", "service", key)
+		}
+		return
+	}
+
 	// 更新 eBPF 中的服务和后端信息
-	if len(pods) > 0 {
-		action := bpf.DefaultAction
-		if c.metrics != nil {
-			action = bpf.WeightedAction
-		}
+	action := bpf.DefaultAction
+	if c.metrics != nil {
+		action = bpf.WeightedAction
+	}
 
-		c.bpfProg.InsertServiceItem(svcIP, svcPort, len(pods), action)
+	c.bpfProg.InsertServiceItem(svcIP, svcPort, len(pods), action)
 
-		percetageSum := 0.0
-		for i, pod := range pods {
-			percetageSum += pod.Weight
-			c.bpfProg.AutoInsertBackend(svcIP, svcPort, pod.IP, pod.Port, i+1, pod.Weight, percetageSum)
-		}
+	percetageSum := 0.0
+	for i, pod := range pods {
+		percetageSum += pod.Weight
+		c.bpfProg.AutoInsertBackend(svcIP, svcPort, pod.IP, pod.Port, i+1, pod.Weight, percetageSum)
 	}
 
 	// 更新 svcStates 中的状态以供后续比较和删除
@@ -394,24 +423,30 @@ func (c *Controller) commitServiceState(key, svcIP, svcPort string, pods []podSt
 		Port: svcPort,
 		Pods: pods,
 	}
-	slog.Info("Synced service", "service", key, "backends", len(pods))
+	slog.Info("Service synced to eBPF", "service", key, "backends", len(pods))
 }
 
-// checkHealth 通过尝试建立 TCP 连接来检查后端 Pod 的健康状态。
-// 如果连接成功，则认为该后端是健康的；如果连接失败，则认为该后端不可用，不会被添加到 eBPF 中。
-func checkHealth(ip, port string) bool {
-	addr := net.JoinHostPort(ip, port)
+func serviceStateEqual(a, b *serviceState) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
 
-	conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
-	if err != nil {
+	if a.IP != b.IP || a.Port != b.Port || len(a.Pods) != len(b.Pods) {
 		return false
 	}
 
-	// 网络的错误不应该导致panic，所以这里记录日志但不返回错误
-	err = conn.Close()
-	if err != nil {
-		slog.Error("Failed to close connection during health check", "address", addr, "error", err)
+	for i := range a.Pods {
+		if !podStateEqual(a.Pods[i], b.Pods[i]) {
+			return false
+		}
 	}
 
 	return true
+}
+
+func podStateEqual(a, b podState) bool {
+	return a.IP == b.IP &&
+		a.Port == b.Port &&
+		a.Healthy == b.Healthy &&
+		math.Abs(a.Weight-b.Weight) < 1e-9
 }
