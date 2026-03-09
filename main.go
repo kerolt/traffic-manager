@@ -20,7 +20,52 @@ func main() {
 	// 解析命令行参数
 	kubeconfig := flag.String("kubeconfig", "", "path of config")
 	metricsAddr := flag.String("metrics-addr", "", "prometheus address for metrics (e.g. http://prometheus:9090)")
+	checkServiceIP := flag.String("check-service-ip", "", "service IP to check in pinned BPF maps")
+	checkServicePort := flag.String("check-service-port", "", "service port to check in pinned BPF maps")
+	dumpStats := flag.Bool("dump-stats", false, "print pinned BPF stats and exit")
 	flag.Parse()
+
+	if *dumpStats {
+		stats, err := bpf.ReadPinnedStats()
+		if err != nil {
+			// 使用 slog 的结构化错误处理，避免冗余的字符串拼接
+			slog.Error("failed to read pinned stats", "error", err)
+			os.Exit(1)
+		}
+
+		// 将 stats 聚合在一个 Group 中，输出会更具组织性
+		slog.Info("BPF metrics dump",
+			slog.Group("stats",
+				slog.Uint64("connect_attempts", stats.ConnectAttempts),
+				slog.Uint64("service_misses", stats.ServiceMisses),
+				slog.Uint64("backend_slot_misses", stats.BackendSlotMisses),
+				slog.Uint64("backend_misses", stats.BackendMisses),
+				slog.Uint64("rewrite_successes", stats.RewriteSuccesses),
+				slog.Uint64("unsupported_actions", stats.UnsupportedAction),
+			),
+		)
+		return
+	}
+
+	// check-service-ip 和 check-service-port 必须同时提供，否则会导致不一致的检查逻辑
+	if (*checkServiceIP == "") != (*checkServicePort == "") {
+		slog.Error("check-service-ip and check-service-port must be used together")
+		os.Exit(2)
+	}
+
+	if *checkServiceIP != "" {
+		exists, service, err := bpf.LookupPinnedService(*checkServiceIP, *checkServicePort)
+		if err != nil {
+			slog.Error("Failed to check pinned service", "error", err)
+			os.Exit(1)
+		}
+		if !exists {
+			os.Exit(1)
+		}
+
+		slog.Info("Pinned service found", "serviceIP", *checkServiceIP, "servicePort", *checkServicePort, "backends", service.Count, "action", service.Action)
+		return
+	}
 
 	if *kubeconfig == "" {
 		*kubeconfig = client.GetDefaultKubeConfigFile()
@@ -51,7 +96,7 @@ func main() {
 	ctrl := controller.NewController(clientSet, &program, *metricsAddr)
 	stopCh := make(chan struct{})
 
-	// 监听 SIGINT/SIGTERM 信号，收到后优雅退出，defer 会自动清理 eBPF 资源
+	// 监听 SIGINT/SIGTERM 信号，收到后优雅退出
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
