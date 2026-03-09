@@ -65,4 +65,7 @@ go.work
 
 vmlinux.h
 *_bpf.*
+
+bin/
 traffic-manager
+traffic-manager-linux
