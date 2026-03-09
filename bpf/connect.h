@@ -39,6 +39,7 @@
 
 #define LB_SERVICE_MAP_MAX_ENTRIES 65536   // 服务映射最大条目数
 #define LB_BACKENDS_MAP_MAX_ENTRIES 65536  // 后端映射最大条目数
+#define LB_STATS_MAP_MAX_ENTRIES 6         // 数据面统计项数量
 
 // 外部流量策略查找范围
 #define LB_LOOKUP_SCOPE_EXT 0  // ExternalTrafficPolicy=Cluster - 允许任意后端
@@ -52,6 +53,15 @@
 #define SVC_ACTION_WEIGHT 1            // 加权负载均衡
 #define SVC_ACTION_MIGRATE 2           // 服务迁移
 #define SVC_ACTION_REDIRECT_SVC 32768  // 重定向到其他服务
+
+enum stat_index {
+    STAT_CONNECT_ATTEMPTS = 0,
+    STAT_SERVICE_MISS = 1,
+    STAT_BACKEND_SLOT_MISS = 2,
+    STAT_BACKEND_MISS = 3,
+    STAT_REWRITE_SUCCESS = 4,
+    STAT_UNSUPPORTED_ACTION = 5,
+};
 
 // svc_key - 负载均衡服务查找键
 // 用于在服务映射表中定位特定的服务配置或其后端槽位
@@ -104,6 +114,23 @@ struct {
     __uint(max_entries, LB_BACKENDS_MAP_MAX_ENTRIES);
     __uint(map_flags, CONDITIONAL_PREALLOC);
 } backend_map SEC(".maps");
+
+// stats_map - 数据面路径统计信息
+// 用于确认 benchmark 期间流量是否真的命中了 eBPF 重写逻辑
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, __u64);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+    __uint(max_entries, LB_STATS_MAP_MAX_ENTRIES);
+} stats_map SEC(".maps");
+
+static __always_inline void incr_stat(__u32 key) {
+    __u64* value = bpf_map_lookup_elem(&stats_map, &key);
+    if (value) {
+        __sync_fetch_and_add(value, 1);
+    }
+}
 
 // 获取数据包目标 IPv4 地址
 static __always_inline __be32 ctx_get_dst_ip(const struct bpf_sock_addr* ctx) {

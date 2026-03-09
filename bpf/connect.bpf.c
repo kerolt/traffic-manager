@@ -35,6 +35,8 @@ const __be16 pod_port = 0x901f;        // 目标业务端口
  *  -1          : 未能识别的服务调度动作类型。
  */
 static int sock4_forward_entry(struct bpf_sock_addr* ctx) {
+    incr_stat(STAT_CONNECT_ATTEMPTS);
+
     // 定义查找键结构
     struct svc_key key = {}, orig_key;
     struct svc_entry* svc;
@@ -55,6 +57,7 @@ static int sock4_forward_entry(struct bpf_sock_addr* ctx) {
     // 第二步: 验证服务是否存在及其健康状态
     svc = lookup_service(&key);
     if (!svc || svc->count == 0) {
+        incr_stat(STAT_SERVICE_MISS);
         return -ENXIO;
     }
 
@@ -77,12 +80,18 @@ static int sock4_forward_entry(struct bpf_sock_addr* ctx) {
             if (key.backend_slot > svc->count) {
                 // 命中重定向逻辑
                 backend_slot = lookup_backend_slot(&key);
-                if (!backend_slot) return -ENOENT;
+                if (!backend_slot) {
+                    incr_stat(STAT_BACKEND_SLOT_MISS);
+                    return -ENOENT;
+                }
                 backend_id = backend_slot->backend_id;
 
                 // 递归查找目标服务的端点信息
                 backend = lookup_backend(backend_id);
-                if (!backend) return -ENOENT;
+                if (!backend) {
+                    incr_stat(STAT_BACKEND_MISS);
+                    return -ENOENT;
+                }
 
                 // 以重定向后的地址作为新起点重新进行后端选择
                 key = orig_key;
@@ -95,22 +104,31 @@ static int sock4_forward_entry(struct bpf_sock_addr* ctx) {
             break;
 
         default:
+            incr_stat(STAT_UNSUPPORTED_ACTION);
             bpf_printk("Error: unsupported service action type [%d]\n", svc->action);
             return -1;
     }
 
     // 第四步: 确立后端槽位元数据
     backend_slot = lookup_backend_slot(&key);
-    if (!backend_slot) return -ENOENT;
+    if (!backend_slot) {
+        incr_stat(STAT_BACKEND_SLOT_MISS);
+        return -ENOENT;
+    }
     backend_id = backend_slot->backend_id;
 
     // 第五步: 提取后端的物理连接元组 (IP & Port)
     backend = lookup_backend(backend_id);
-    if (!backend) return -ENOENT;
+    if (!backend) {
+        incr_stat(STAT_BACKEND_MISS);
+        return -ENOENT;
+    }
 
     // 第六步: 将连接的目标变更为后端 Pod 地址,从而实现负载均衡的分发逻辑
     ctx_set_dst_ip(ctx, backend->address);
     ctx_set_dst_port(ctx, backend->port);
+
+    incr_stat(STAT_REWRITE_SUCCESS);
 
     return 0;
 }

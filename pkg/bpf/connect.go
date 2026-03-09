@@ -2,11 +2,13 @@ package bpf
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -18,6 +20,30 @@ import (
 )
 
 const MapsPinPath = "/sys/fs/bpf/sock_ops_map"
+
+const (
+	ServiceMapPinPath = MapsPinPath + "/services_map"
+	BackendMapPinPath = MapsPinPath + "/backend_map"
+	StatsMapPinPath   = MapsPinPath + "/stats_map"
+)
+
+const (
+	statConnectAttempts uint32 = iota
+	statServiceMiss
+	statBackendSlotMiss
+	statBackendMiss
+	statRewriteSuccess
+	statUnsupportedAction
+)
+
+type TrafficStats struct {
+	ConnectAttempts   uint64
+	ServiceMisses     uint64
+	BackendSlotMisses uint64
+	BackendMisses     uint64
+	RewriteSuccesses  uint64
+	UnsupportedAction uint64
+}
 
 type Program struct {
 	connectObj    connectObjects
@@ -141,10 +167,87 @@ func (p *Program) Close() {
 		slog.Info("Unpin and close backend map")
 	}
 
+	if p.connectObj.connectMaps.StatsMap != nil {
+		p.connectObj.connectMaps.StatsMap.Unpin()
+		p.connectObj.connectMaps.StatsMap.Close()
+		slog.Info("Unpin and close stats map")
+	}
+
 	err := os.Remove(MapsPinPath)
 	if err != nil {
 		slog.Warn("Remove map pin file path failed", "path", MapsPinPath, "error", err)
 	}
+}
+
+func LookupPinnedService(serviceIP string, servicePort string) (bool, *ServiceEntry, error) {
+	parsedIP := net.ParseIP(serviceIP)
+	if parsedIP == nil {
+		return false, nil, fmt.Errorf("invalid service IP: %s", serviceIP)
+	}
+
+	servicePortInt, err := strconv.Atoi(servicePort)
+	if err != nil {
+		return false, nil, fmt.Errorf("invalid service port: %w", err)
+	}
+
+	servicesMap, err := ebpf.LoadPinnedMap(filepath.Clean(ServiceMapPinPath), nil)
+	if err != nil {
+		return false, nil, err
+	}
+	defer servicesMap.Close()
+
+	for _, scope := range []uint8{1, 0} {
+		serviceKey := NewServiceKey(parsedIP, uint16(servicePortInt), u8proto.ANY, scope, 0)
+		serviceValue := NewServiceEntry(BackendId{0}, 0, Possibility{0, 0}, DefaultAction)
+
+		err := servicesMap.Lookup(serviceKey.ToNetwork(), serviceValue)
+		if err == nil {
+			return true, serviceValue.ToHost(), nil
+		}
+		if !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return false, nil, err
+		}
+	}
+
+	return false, nil, nil
+}
+
+func ReadPinnedStats() (TrafficStats, error) {
+	statsMap, err := ebpf.LoadPinnedMap(filepath.Clean(StatsMapPinPath), nil)
+	if err != nil {
+		return TrafficStats{}, err
+	}
+	defer statsMap.Close()
+
+	readStat := func(index uint32) (uint64, error) {
+		var value uint64
+		if err := statsMap.Lookup(index, &value); err != nil {
+			return 0, err
+		}
+		return value, nil
+	}
+
+	stats := TrafficStats{}
+	if stats.ConnectAttempts, err = readStat(statConnectAttempts); err != nil {
+		return TrafficStats{}, err
+	}
+	if stats.ServiceMisses, err = readStat(statServiceMiss); err != nil {
+		return TrafficStats{}, err
+	}
+	if stats.BackendSlotMisses, err = readStat(statBackendSlotMiss); err != nil {
+		return TrafficStats{}, err
+	}
+	if stats.BackendMisses, err = readStat(statBackendMiss); err != nil {
+		return TrafficStats{}, err
+	}
+	if stats.RewriteSuccesses, err = readStat(statRewriteSuccess); err != nil {
+		return TrafficStats{}, err
+	}
+	if stats.UnsupportedAction, err = readStat(statUnsupportedAction); err != nil {
+		return TrafficStats{}, err
+	}
+
+	return stats, nil
 }
 
 // InsertServiceItem 将服务元数据插入 Service Map
@@ -164,7 +267,7 @@ func (p *Program) InsertServiceItem(serviceIP string, servicePort string, backen
 		return false
 	}
 
-	slog.Info("InsertServiceItem succeeded", "serviceIP", serviceIP, "servicePort", servicePortInt, "backendNumber", backendNumber)
+	slog.Debug("InsertServiceItem succeeded", "serviceIP", serviceIP, "servicePort", servicePortInt, "backendNumber", backendNumber)
 	return true
 }
 
@@ -177,7 +280,7 @@ func (p *Program) DeleteServiceItem(serviceIP string, servicePort int, slotIndex
 		slog.Error("DeleteServiceItem: connectObj.connectMaps.ServicesMap.Delete failed", "error", err)
 		return false
 	}
-	slog.Info("DeleteServiceItem succeeded", "serviceIP", serviceIP, "servicePort", servicePort, "slotIndex", slotIndex)
+	slog.Debug("DeleteServiceItem succeeded", "serviceIP", serviceIP, "servicePort", servicePort, "slotIndex", slotIndex)
 	return true
 }
 
@@ -202,7 +305,7 @@ func (p *Program) InsertBackendItem(serviceIP string, servicePort int, backendIP
 		slog.Error("InsertBackendItem: connectObj.connectMaps.BackendMap.Update failed", "error", err)
 		return false
 	}
-	slog.Info("InsertBackendItem succeeded", "serviceIP", serviceIP, "servicePort", servicePort, "backendID", backendID, "slotIndex", slotIndex, "possibility", possibility)
+	slog.Debug("InsertBackendItem succeeded", "serviceIP", serviceIP, "servicePort", servicePort, "backendID", backendID, "slotIndex", slotIndex, "possibility", possibility)
 	return true
 }
 
@@ -214,7 +317,7 @@ func (p *Program) DeleteBackendItem(backendID int) bool {
 		slog.Error("DeleteBackendItem: connectObj.connectMaps.BackendMap.Delete Delete", "error", err)
 		return false
 	}
-	slog.Info("DeleteBackendItem succeeded", "backendID", backendID)
+	slog.Debug("DeleteBackendItem succeeded", "backendID", backendID)
 	return true
 }
 
@@ -289,8 +392,8 @@ func (p *Program) AutoDeleteService(service Service, affiliatedServiceList []Ser
 		p.DeleteServiceItem(serviceIP, servicePort, i)
 	}
 
-	// TODO: 处理级联服务的清理逻辑 (目前代码有些混淆,仅作语法适配)
-	for i := 0; i < len(affiliatedServiceList); i++ {
+	// TODO: 处理级联服务的清理逻辑
+	for i := range affiliatedServiceList {
 		if err != nil {
 			slog.Error("AutoDeleteService: servicePort parse failed", "error", err)
 			return false
@@ -306,7 +409,7 @@ func (p *Program) AutoDeleteService(service Service, affiliatedServiceList []Ser
 		p.DeleteServiceItem(serviceIP, servicePort, int(serviceValue.Count)+i+1)
 		p.AutoDeleteBackend(int(backendServiceValue.BackendID.ID))
 	}
-	slog.Info("AutoDeleteService succeeded", "serviceIP", serviceIP, "servicePort", servicePort)
+	slog.Debug("AutoDeleteService succeeded", "serviceIP", serviceIP, "servicePort", servicePort)
 	return true
 }
 
@@ -341,7 +444,7 @@ func (p *Program) AutoInsertBackend(serviceIP string, servicePortStr string, bac
 	if ok {
 		// 4. 记录在内存中，用于清理
 		p.backEndSet[backendID] = true
-		slog.Info("AutoInsertBackend succeeded",
+		slog.Debug("AutoInsertBackend succeeded",
 			"serviceIP", serviceIP,
 			"servicePort", servicePort,
 			"backendIP", backendIP,
@@ -359,7 +462,7 @@ func (p *Program) AutoDeleteBackend(backendID int) bool {
 	delete(p.backEndSet, backendID)
 	ok := p.DeleteBackendItem(backendID)
 	if ok {
-		slog.Info("AutoDeleteBackend succeeded", "backendID", backendID)
+		slog.Debug("AutoDeleteBackend succeeded", "backendID", backendID)
 	}
 	return ok
 }
