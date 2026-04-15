@@ -4,7 +4,7 @@ go 1.25.7
 
 require (
 	github.com/cilium/cilium v1.19.1
-	github.com/cilium/ebpf v0.20.1-0.20260108141042-f7e80f49188b
+	github.com/cilium/ebpf v0.21.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/common v0.67.5
 	k8s.io/api v0.35.1
@@ -105,3 +105,5 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.0 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
+
+tool github.com/cilium/ebpf/cmd/bpf2go
