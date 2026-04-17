@@ -15,23 +15,20 @@ import (
 const maxPossibilityUnit = 1024
 
 // ServiceKey 对应 eBPF 代码中的 struct svc_key
-// 用于在 Service Map 中定位服务或其后端槽位
+// 用于在 Service Meta Map 中定位服务元数据
 type ServiceKey struct {
-	Address     types.IPv4 `align:"address"`      // 服务虚拟 IPv4 地址
-	Port        uint16     `align:"dport"`        // 服务端口
-	BackendSlot uint16     `align:"backend_slot"` // 槽位索引: 0=服务元数据, >0=后端槽位
-	Proto       uint8      `align:"proto"`        // L4 协议类型
-	Scope       uint8      `align:"scope"`        // 查找范围 (Local/Cluster)
-	Pad         [2]uint8   `align:"pad"`          // 对齐填充
+	Address types.IPv4 `align:"address"` // 服务虚拟 IPv4 地址
+	Port    uint16     `align:"dport"`   // 服务端口
+	Proto   uint8      `align:"proto"`   // L4 协议类型
+	Scope   uint8      `align:"scope"`   // 查找范围 (Local/Cluster)
 }
 
 // NewServiceKey 创建一个新的 ServiceKey 实例
-func NewServiceKey(ip net.IP, port uint16, proto u8proto.U8proto, scope uint8, slot uint16) *ServiceKey {
+func NewServiceKey(ip net.IP, port uint16, proto u8proto.U8proto, scope uint8) *ServiceKey {
 	key := ServiceKey{
-		Port:        port,
-		Proto:       uint8(proto),
-		Scope:       scope,
-		BackendSlot: slot,
+		Port:  port,
+		Proto: uint8(proto),
+		Scope: scope,
 	}
 	copy(key.Address[:], ip.To4())
 	return &key
@@ -57,60 +54,102 @@ func (k *ServiceKey) String() string {
 	if kHost.Scope == loadbalancer.ScopeInternal {
 		addr += "/i"
 	}
-	if k.BackendSlot != 0 {
-		addr += " slot: " + strconv.Itoa(int(k.BackendSlot))
-	}
 	return addr
 }
 
-// Action 定义服务调度的策略类型
-type Action uint16
-
-const (
-	DefaultAction  Action = 0     // 默认 (通常等同于随机)
-	RandomAction   Action = 0     // 随机轮询
-	WeightedAction Action = 1     // 加权轮询
-	RedirectAction Action = 32768 // 服务重定向
-)
-
-// ServiceEntry 对应 eBPF 代码中的 struct svc_entry
-// 存储服务的元数据或具体的后端槽位配置
-type ServiceEntry struct {
-	BackendID        BackendId `align:"backend_id"`         // 后端全局 ID
-	Count            uint16    `align:"count"`              // 后端总数 (仅在 metadata 中有效)
-	Possibility      uint16    `align:"possibility"`        // 权重值 (仅在 backend slot 中有效)
-	Action           Action    `align:"action"`             // 调度策略
-	WeightRangeUpper uint16    `align:"weight_range_upper"` // 加权区间上限 (用于快速选择)
+// ServiceSlotKey 对应 eBPF 代码中的 struct svc_slot_key
+// 用于在 Service Slot Map 中定位服务后端槽位。
+type ServiceSlotKey struct {
+	Address     types.IPv4 `align:"address"`
+	Port        uint16     `align:"dport"`
+	BackendSlot uint16     `align:"backend_slot"`
+	Proto       uint8      `align:"proto"`
+	Scope       uint8      `align:"scope"`
+	pad         [2]uint8   `align:"pad"`
 }
 
-// NewServiceEntry 创建一个新的 ServiceEntry 实例
-func NewServiceEntry(backendId BackendId, count uint16, possibility Possibility, action Action) *ServiceEntry {
-	value := ServiceEntry{
-		BackendID:        backendId,
-		Count:            count,
-		Possibility:      uint16(possibility.percentage * maxPossibilityUnit),
-		Action:           action,
-		WeightRangeUpper: uint16(possibility.currentPercentageRangeUpper * maxPossibilityUnit),
+func NewServiceSlotKey(ip net.IP, port uint16, proto u8proto.U8proto, scope uint8, slot uint16) *ServiceSlotKey {
+	key := ServiceSlotKey{
+		Port:        port,
+		Proto:       uint8(proto),
+		Scope:       scope,
+		BackendSlot: slot,
 	}
-	return &value
+	copy(key.Address[:], ip.To4())
+	return &key
 }
 
-func (s *ServiceEntry) String() string {
-	sHost := s.ToHost()
-	return fmt.Sprintf("%d %d (%d) [0x%x]", sHost.BackendID, sHost.Count, sHost.Possibility, sHost.Action)
-}
-
-// ToNetwork 将 ServiceEntry 转换为网络字节序
-func (s *ServiceEntry) ToNetwork() *ServiceEntry {
-	n := *s
-	// 注意: Payload 数据通常不需要字节序转换,除非明确规定
+func (k *ServiceSlotKey) ToNetwork() *ServiceSlotKey {
+	n := *k
+	n.Port = byteorder.HostToNetwork16(n.Port)
 	return &n
 }
 
-// ToHost 将 ServiceEntry 转换为对应的格式
-func (s *ServiceEntry) ToHost() *ServiceEntry {
+func (k *ServiceSlotKey) String() string {
+	addr := net.JoinHostPort(k.Address.String(), fmt.Sprintf("%d", k.Port))
+	if k.Scope == loadbalancer.ScopeInternal {
+		addr += "/i"
+	}
+	addr += " slot: " + strconv.Itoa(int(k.BackendSlot))
+	return addr
+}
+
+// ServiceMeta 对应 eBPF 代码中的 struct svc_meta，存储服务元数据。
+type ServiceMeta struct {
+	Count       uint16 `align:"count"`
+	Action      Action `align:"action"`
+	TotalWeight uint16 `align:"total_weight"`
+	Pad         uint16 `align:"pad"`
+}
+
+func NewServiceMeta(count uint16, action Action, totalWeight uint16) *ServiceMeta {
+	return &ServiceMeta{
+		Count:       count,
+		Action:      action,
+		TotalWeight: totalWeight,
+	}
+}
+
+func (s *ServiceMeta) String() string {
+	sHost := s.ToHost()
+	return fmt.Sprintf("%d (%d) [0x%x]", sHost.Count, sHost.TotalWeight, sHost.Action)
+}
+
+func (s *ServiceMeta) ToNetwork() *ServiceMeta {
+	n := *s
+	return &n
+}
+
+func (s *ServiceMeta) ToHost() *ServiceMeta {
 	h := *s
 	return &h
+}
+
+type ServiceEntry = ServiceMeta
+
+// ServiceSlot 对应 eBPF 代码中的 struct svc_slot
+// 存储服务后端槽位配置。
+type ServiceSlot struct {
+	BackendID        BackendId `align:"backend_id"`
+	Possibility      uint16    `align:"possibility"`
+	WeightRangeUpper uint16    `align:"weight_range_upper"`
+}
+
+func NewServiceSlot(backendId BackendId, possibility Possibility) *ServiceSlot {
+	return &ServiceSlot{
+		BackendID:        backendId,
+		Possibility:      uint16(possibility.percentage * maxPossibilityUnit),
+		WeightRangeUpper: uint16(possibility.currentPercentageRangeUpper * maxPossibilityUnit),
+	}
+}
+
+func (s *ServiceSlot) String() string {
+	return fmt.Sprintf("%d (%d/%d)", s.BackendID.ID, s.Possibility, s.WeightRangeUpper)
+}
+
+func (s *ServiceSlot) ToNetwork() *ServiceSlot {
+	n := *s
+	return &n
 }
 
 // BackendId 包装后端 ID 类型
